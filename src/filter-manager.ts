@@ -3,6 +3,8 @@
  * Provides comprehensive filter management functionality
  */
 
+import { toolFailure } from "./failureEnvelope.js";
+
 // Type definitions for Gmail API filters
 export interface GmailFilterCriteria {
     from?: string;
@@ -49,10 +51,7 @@ export async function createFilter(gmail: any, criteria: GmailFilterCriteria, ac
 
         return response.data;
     } catch (error: any) {
-        if (error.code === 400) {
-            throw new Error(`Invalid filter criteria or action: ${error.message}`);
-        }
-        throw new Error(`Failed to create filter: ${error.message}`);
+        throw toolFailure(error, 'Could not create the filter');
     }
 }
 
@@ -74,7 +73,7 @@ export async function listFilters(gmail: any) {
             count: filters.length
         };
     } catch (error: any) {
-        throw new Error(`Failed to list filters: ${error.message}`);
+        throw toolFailure(error, 'Could not list the filters');
     }
 }
 
@@ -93,10 +92,7 @@ export async function getFilter(gmail: any, filterId: string) {
 
         return response.data;
     } catch (error: any) {
-        if (error.code === 404) {
-            throw new Error(`Filter with ID "${filterId}" not found.`);
-        }
-        throw new Error(`Failed to get filter: ${error.message}`);
+        throw toolFailure(error, `Could not get the filter "${filterId}"`);
     }
 }
 
@@ -115,10 +111,7 @@ export async function deleteFilter(gmail: any, filterId: string) {
 
         return { success: true, message: `Filter "${filterId}" deleted successfully.` };
     } catch (error: any) {
-        if (error.code === 404) {
-            throw new Error(`Filter with ID "${filterId}" not found.`);
-        }
-        throw new Error(`Failed to delete filter: ${error.message}`);
+        throw toolFailure(error, `Could not delete the filter "${filterId}"`);
     }
 }
 

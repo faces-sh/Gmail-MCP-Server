@@ -11,6 +11,7 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { OAuth2Client } from 'google-auth-library';
 import { resolveArgs, wrapResult } from "./circuitBuffer.js";
+import { ToolFailure, toolFailure, failureResult, redact } from "./failureEnvelope.js";
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -94,7 +95,14 @@ function extractEmailContent(messagePart: GmailMessagePart): EmailContent {
     return { text: textContent, html: htmlContent };
 }
 
-async function loadCredentials() {
+/**
+ * Load the OAuth keys and the saved sign-in.
+ *
+ * Returns the failure rather than exiting when there is nothing to authenticate with: as a server, dying
+ * at startup tells the caller only that a pipe closed, while a `[no_credentials]` envelope on the first
+ * tool call says which file is missing. The `auth` CLI still exits, because there is nobody to answer.
+ */
+async function loadCredentials(isAuthMode: boolean): Promise<ToolFailure | null> {
     try {
         // Create config directory if it doesn't exist
         if (!process.env.GMAIL_OAUTH_PATH && !CREDENTIALS_PATH &&!fs.existsSync(CONFIG_DIR)) {
@@ -112,16 +120,16 @@ async function loadCredentials() {
         }
 
         if (!fs.existsSync(OAUTH_PATH)) {
-            console.error('Error: OAuth keys file not found. Please place gcp-oauth.keys.json in current directory or', CONFIG_DIR);
-            process.exit(1);
+            return new ToolFailure('no_credentials',
+                `Could not reach Gmail: there is no Google OAuth keys file at ${OAUTH_PATH}`);
         }
 
         const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
         const keys = keysContent.installed || keysContent.web;
 
         if (!keys) {
-            console.error('Error: Invalid OAuth keys file format. File should contain either "installed" or "web" credentials.');
-            process.exit(1);
+            return new ToolFailure('no_credentials',
+                `Could not reach Gmail: the OAuth keys file at ${OAUTH_PATH} has neither an "installed" nor a "web" section`);
         }
 
         const callback = process.argv[2] === 'auth' && process.argv[3] 
@@ -137,10 +145,18 @@ async function loadCredentials() {
         if (fs.existsSync(CREDENTIALS_PATH)) {
             const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
             oauth2Client.setCredentials(credentials);
+        } else if (!isAuthMode) {
+            return new ToolFailure('no_credentials',
+                `Could not reach Gmail: there is no saved Gmail sign-in at ${CREDENTIALS_PATH}`);
         }
+
+        return null;
     } catch (error) {
-        console.error('Error loading credentials:', error);
-        process.exit(1);
+        // Never log the raw error: a corrupt credentials.json puts the token itself into the parse
+        // message, and the envelope's text is redacted.
+        const failure = toolFailure(error, 'Could not load the saved Gmail credentials');
+        console.error(failure.text);
+        return failure;
     }
 }
 
@@ -169,7 +185,8 @@ async function authenticate() {
             if (!code) {
                 res.writeHead(400);
                 res.end('No code provided');
-                reject(new Error('No code provided'));
+                reject(new ToolFailure('bad_request',
+                    'Could not complete Google sign-in: the callback carried no authorization code'));
                 return;
             }
 
@@ -185,7 +202,7 @@ async function authenticate() {
             } catch (error) {
                 res.writeHead(500);
                 res.end('Authentication failed');
-                reject(error);
+                reject(toolFailure(error, 'Could not complete Google sign-in'));
             }
         });
     });
@@ -319,11 +336,42 @@ const DownloadAttachmentSchema = z.object({
 });
 
 
+/**
+ * What did not happen, per tool: line 1 of the failure envelope. Plain English, no symbols, and never a
+ * remedy, because this server knows what failed and not what the person should do about it.
+ */
+const FAILED_ACTION: Record<string, string> = {
+    send_email: 'Could not send the email',
+    draft_email: 'Could not save the draft',
+    read_email: 'Could not read the email',
+    search_emails: 'Could not search the mailbox',
+    modify_email: "Could not change the email's labels",
+    delete_email: 'Could not delete the email',
+    list_email_labels: 'Could not list the labels',
+    batch_modify_emails: 'Could not change the labels on those emails',
+    batch_delete_emails: 'Could not delete those emails',
+    create_label: 'Could not create the label',
+    update_label: 'Could not update the label',
+    delete_label: 'Could not delete the label',
+    get_or_create_label: 'Could not get or create the label',
+    create_filter: 'Could not create the filter',
+    list_filters: 'Could not list the filters',
+    get_filter: 'Could not get the filter',
+    delete_filter: 'Could not delete the filter',
+    create_filter_from_template: 'Could not create the filter from that template',
+    download_attachment: 'Could not download the attachment',
+};
+
 // Main function
 async function main() {
-    await loadCredentials();
+    const isAuthMode = process.argv[2] === 'auth';
+    const credentialsFailure = await loadCredentials(isAuthMode);
 
-    if (process.argv[2] === 'auth') {
+    if (isAuthMode) {
+        if (credentialsFailure) {
+            console.error(credentialsFailure.text);
+            process.exit(1);
+        }
         await authenticate();
         console.log('Authentication completed successfully');
         process.exit(0);
@@ -445,6 +493,10 @@ async function main() {
     const rawGmailCallTool = async (request: any) => {
         const { name, arguments: args } = request.params;
 
+        // Nothing to authenticate with means no tool can do anything. Say which file is missing, once,
+        // in the same envelope as everything else, instead of failing deeper with a different shape.
+        if (credentialsFailure) return credentialsFailure.toResult();
+
         async function handleEmailAction(action: "send" | "draft", validatedArgs: any) {
             let message: string;
             
@@ -560,7 +612,8 @@ async function main() {
             } catch (error: any) {
                 // Log attachment-related errors for debugging
                 if (validatedArgs.attachments && validatedArgs.attachments.length > 0) {
-                    console.error(`Failed to send email with ${validatedArgs.attachments.length} attachments:`, error.message);
+                    console.error(`Failed to send email with ${validatedArgs.attachments.length} attachments:`,
+                        redact(String(error?.message ?? error)));
                 }
                 throw error;
             }
@@ -820,13 +873,21 @@ async function main() {
                     const successCount = successes.length;
                     const failureCount = failures.length;
                     
+                    // Rule 6: if every message failed, this call failed. Reporting "processed 0" as a
+                    // success is the shape that made a 401 look like an empty mailbox.
+                    if (successCount === 0 && failureCount > 0) {
+                        throw toolFailure(failures[0].error,
+                            `Could not change the labels on any of the ${failureCount} emails`);
+                    }
+
                     let resultText = `Batch label modification complete.\n`;
                     resultText += `Successfully processed: ${successCount} messages\n`;
                     
                     if (failureCount > 0) {
                         resultText += `Failed to process: ${failureCount} messages\n\n`;
                         resultText += `Failed message IDs:\n`;
-                        resultText += failures.map(f => `- ${(f.item as string).substring(0, 16)}... (${f.error.message})`).join('\n');
+                        resultText += failures.map(f => `- ${(f.item as string).substring(0, 16)}... (${toolFailure(f.error, 'Could not change the labels on this email').brief})`).join('\n');
+                        resultText += `\n\nFirst failure in full:\n${toolFailure(failures[0].error, 'Could not change the labels on this email').text}`;
                     }
 
                     return {
@@ -866,13 +927,20 @@ async function main() {
                     const successCount = successes.length;
                     const failureCount = failures.length;
                     
+                    // Rule 6: if every delete failed, this call failed.
+                    if (successCount === 0 && failureCount > 0) {
+                        throw toolFailure(failures[0].error,
+                            `Could not delete any of the ${failureCount} emails`);
+                    }
+
                     let resultText = `Batch delete operation complete.\n`;
                     resultText += `Successfully deleted: ${successCount} messages\n`;
                     
                     if (failureCount > 0) {
                         resultText += `Failed to delete: ${failureCount} messages\n\n`;
                         resultText += `Failed message IDs:\n`;
-                        resultText += failures.map(f => `- ${(f.item as string).substring(0, 16)}... (${f.error.message})`).join('\n');
+                        resultText += failures.map(f => `- ${(f.item as string).substring(0, 16)}... (${toolFailure(f.error, 'Could not delete this email').brief})`).join('\n');
+                        resultText += `\n\nFirst failure in full:\n${toolFailure(failures[0].error, 'Could not delete this email').text}`;
                     }
 
                     return {
@@ -1071,30 +1139,30 @@ async function main() {
                     
                     switch (template) {
                         case 'fromSender':
-                            if (!params.senderEmail) throw new Error("senderEmail is required for fromSender template");
+                            if (!params.senderEmail) throw new ToolFailure('bad_request', "Could not create the filter: the fromSender template needs a senderEmail");
                             filterConfig = filterTemplates.fromSender(params.senderEmail, params.labelIds, params.archive);
                             break;
                         case 'withSubject':
-                            if (!params.subjectText) throw new Error("subjectText is required for withSubject template");
+                            if (!params.subjectText) throw new ToolFailure('bad_request', "Could not create the filter: the withSubject template needs a subjectText");
                             filterConfig = filterTemplates.withSubject(params.subjectText, params.labelIds, params.markAsRead);
                             break;
                         case 'withAttachments':
                             filterConfig = filterTemplates.withAttachments(params.labelIds);
                             break;
                         case 'largeEmails':
-                            if (!params.sizeInBytes) throw new Error("sizeInBytes is required for largeEmails template");
+                            if (!params.sizeInBytes) throw new ToolFailure('bad_request', "Could not create the filter: the largeEmails template needs a sizeInBytes");
                             filterConfig = filterTemplates.largeEmails(params.sizeInBytes, params.labelIds);
                             break;
                         case 'containingText':
-                            if (!params.searchText) throw new Error("searchText is required for containingText template");
+                            if (!params.searchText) throw new ToolFailure('bad_request', "Could not create the filter: the containingText template needs a searchText");
                             filterConfig = filterTemplates.containingText(params.searchText, params.labelIds, params.markImportant);
                             break;
                         case 'mailingList':
-                            if (!params.listIdentifier) throw new Error("listIdentifier is required for mailingList template");
+                            if (!params.listIdentifier) throw new ToolFailure('bad_request', "Could not create the filter: the mailingList template needs a listIdentifier");
                             filterConfig = filterTemplates.mailingList(params.listIdentifier, params.labelIds, params.archive);
                             break;
                         default:
-                            throw new Error(`Unknown template: ${template}`);
+                            throw new ToolFailure('bad_request', `Could not create the filter: there is no template called "${template}"`);
                     }
 
                     const result = await createFilter(gmail, filterConfig.criteria, filterConfig.action);
@@ -1120,7 +1188,8 @@ async function main() {
                         });
 
                         if (!attachmentResponse.data.data) {
-                            throw new Error('No attachment data received');
+                            throw new ToolFailure('no_data',
+                                `Could not download attachment ${validatedArgs.attachmentId}: Gmail returned no attachment data`);
                         }
 
                         // Decode the base64 data
@@ -1174,29 +1243,16 @@ async function main() {
                             ],
                         };
                     } catch (error: any) {
-                        return {
-                            content: [
-                                {
-                                    type: "text",
-                                    text: `Failed to download attachment: ${error.message}`,
-                                },
-                            ],
-                        };
+                        return failureResult(error,
+                            `Could not download attachment ${validatedArgs.attachmentId} from email ${validatedArgs.messageId}`);
                     }
                 }
 
                 default:
-                    throw new Error(`Unknown tool: ${name}`);
+                    throw new ToolFailure('unknown_tool', `Could not run "${name}": this server has no tool by that name`);
             }
         } catch (error: any) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Error: ${error.message}`,
-                    },
-                ],
-            };
+            return failureResult(error, FAILED_ACTION[name] ?? `Could not run "${name}"`);
         }
     };
 
@@ -1204,7 +1260,13 @@ async function main() {
     // body, a search result) behind a handle on the way out, so it can flow into the next tool by reference
     // (docs/reqs/007). No-op without the circuit env, so the server still runs standalone.
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const resolved = await resolveArgs(request.params.arguments ?? {});
+        let resolved: any;
+        try {
+            resolved = await resolveArgs(request.params.arguments ?? {});
+        } catch (error) {
+            return failureResult(error,
+                `${FAILED_ACTION[request.params.name] ?? `Could not run "${request.params.name}"`}: one of its arguments could not be expanded`);
+        }
         const result = await rawGmailCallTool({ ...request, params: { ...request.params, arguments: resolved } });
         return await wrapResult(result);
     });
@@ -1214,6 +1276,6 @@ async function main() {
 }
 
 main().catch((error) => {
-    console.error('Server error:', error);
+    console.error(toolFailure(error, 'The Gmail server could not start').text);
     process.exit(1);
 });

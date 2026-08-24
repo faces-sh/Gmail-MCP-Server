@@ -5,9 +5,12 @@
 //   wrapResult(result) on return (park a large result + PREPEND its slug so the next tool can wire it).
 // No-op when the circuit env is absent (server run outside Maestro), so the server still works solo.
 
+import { ToolFailure, toolFailure } from "./failureEnvelope.js";
+
 const THRESHOLD = 200;
 
-export class CircuitError extends Error {}
+/** A circuit failure IS a tool failure, so it reaches the caller as the same envelope. */
+export class CircuitError extends ToolFailure {}
 
 function cfg(): { url: string; secret: string; session: string } | null {
   const url = (process.env.MAESTRO_CIRCUIT_URL || "").trim();
@@ -16,21 +19,46 @@ function cfg(): { url: string; secret: string; session: string } | null {
   return url && secret && session ? { url, secret, session } : null;
 }
 
-async function post(path: string, body: unknown, url: string, secret: string): Promise<{ status: number; json: any }> {
+async function post(path: string, body: unknown, url: string, secret: string): Promise<{ status: number; json: any; text: string }> {
   const r = await fetch(url.replace(/\/$/, "") + path, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Circuit-Secret": secret },
     body: JSON.stringify(body),
   });
-  return { status: r.status, json: r.status === 200 ? await r.json() : null };
+  // Read the body whatever the status: on a failure it is the evidence the caller has to report.
+  const text = await r.text();
+  let json: any = null;
+  if (r.status === 200) {
+    try { json = JSON.parse(text); } catch { json = null; }
+  }
+  return { status: r.status, json, text };
 }
 
 async function fetchSlug(slug: string, c: { url: string; secret: string; session: string }): Promise<string> {
-  const { status, json } = await post("/get", { session: c.session, slug }, c.url, c.secret);
-  if (status === 404) {
-    throw new CircuitError(`Unknown or expired circuit slug ${slug}; it is no longer cached, re-fetch it.`);
+  let status: number;
+  let json: any;
+  let text: string;
+  try {
+    ({ status, json, text } = await post("/get", { session: c.session, slug }, c.url, c.secret));
+  } catch (error) {
+    throw toolFailure(error, `Could not expand ${slug}: Maestro's circuit buffer did not answer`);
   }
-  return (json && json.payload) || "";
+  if (status === 404) {
+    // Keeps the recovery the model already had ("re-fetch it"), which this server does know: the cache
+    // it is talking about is its own, not a provider's.
+    throw new CircuitError("expired_handle",
+      `Circuit slug ${slug} is no longer cached, so it could not be expanded; re-fetch what it stood for`);
+  }
+  if (status !== 200) {
+    throw new CircuitError("circuit_error", `Could not expand circuit slug ${slug}`, `HTTP ${status}`, text || undefined);
+  }
+  // Never fall back to an empty payload: a tool asked to act on @@hN@@ would then act on nothing at all,
+  // which is a failure wearing a success (send an email whose body silently became "").
+  const payload = json && json.payload;
+  if (typeof payload !== "string") {
+    throw new CircuitError("circuit_error", `Could not expand circuit slug ${slug}: the circuit buffer returned no payload`, undefined, text || undefined);
+  }
+  return payload;
 }
 
 export async function resolveArgs(args: any): Promise<any> {
@@ -59,7 +87,9 @@ export async function resolveArgs(args: any): Promise<any> {
 
 export async function wrapResult(result: any): Promise<any> {
   const c = cfg();
-  if (!c || !result || !Array.isArray(result.content)) return result;
+  // A failure envelope is never parked or prefixed: `[<code>]` has to lead the text with nothing before
+  // it, and a caller cannot read a status and a body out of a handle.
+  if (!c || !result || result.isError === true || !Array.isArray(result.content)) return result;
   const first = result.content[0];
   if (!first || first.type !== "text" || typeof first.text !== "string" || first.text.length < THRESHOLD) {
     return result;

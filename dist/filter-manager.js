@@ -2,6 +2,7 @@
  * Filter Manager for Gmail MCP Server
  * Provides comprehensive filter management functionality
  */
+import { toolFailure } from "./failureEnvelope.js";
 /**
  * Creates a new Gmail filter
  * @param gmail - Gmail API instance
@@ -22,10 +23,7 @@ export async function createFilter(gmail, criteria, action) {
         return response.data;
     }
     catch (error) {
-        if (error.code === 400) {
-            throw new Error(`Invalid filter criteria or action: ${error.message}`);
-        }
-        throw new Error(`Failed to create filter: ${error.message}`);
+        throw toolFailure(error, 'Could not create the filter');
     }
 }
 /**
@@ -45,7 +43,7 @@ export async function listFilters(gmail) {
         };
     }
     catch (error) {
-        throw new Error(`Failed to list filters: ${error.message}`);
+        throw toolFailure(error, 'Could not list the filters');
     }
 }
 /**
@@ -63,10 +61,7 @@ export async function getFilter(gmail, filterId) {
         return response.data;
     }
     catch (error) {
-        if (error.code === 404) {
-            throw new Error(`Filter with ID "${filterId}" not found.`);
-        }
-        throw new Error(`Failed to get filter: ${error.message}`);
+        throw toolFailure(error, `Could not get the filter "${filterId}"`);
     }
 }
 /**
@@ -84,10 +79,7 @@ export async function deleteFilter(gmail, filterId) {
         return { success: true, message: `Filter "${filterId}" deleted successfully.` };
     }
     catch (error) {
-        if (error.code === 404) {
-            throw new Error(`Filter with ID "${filterId}" not found.`);
-        }
-        throw new Error(`Failed to delete filter: ${error.message}`);
+        throw toolFailure(error, `Could not delete the filter "${filterId}"`);
     }
 }
 /**

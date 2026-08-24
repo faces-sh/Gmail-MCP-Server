@@ -3,6 +3,8 @@
  * Provides comprehensive label management functionality
  */
 
+import { ToolFailure, toolFailure } from "./failureEnvelope.js";
+
 // Type definitions for Gmail API labels
 export interface GmailLabel {
     id: string;
@@ -45,12 +47,7 @@ export async function createLabel(gmail: any, labelName: string, options: {
 
         return response.data;
     } catch (error: any) {
-        // Handle duplicate labels more gracefully
-        if (error.message && error.message.includes('already exists')) {
-            throw new Error(`Label "${labelName}" already exists. Please use a different name.`);
-        }
-        
-        throw new Error(`Failed to create label: ${error.message}`);
+        throw toolFailure(error, `Could not create the label "${labelName}"`);
     }
 }
 
@@ -81,11 +78,7 @@ export async function updateLabel(gmail: any, labelId: string, updates: {
 
         return response.data;
     } catch (error: any) {
-        if (error.code === 404) {
-            throw new Error(`Label with ID "${labelId}" not found.`);
-        }
-        
-        throw new Error(`Failed to update label: ${error.message}`);
+        throw toolFailure(error, `Could not update the label "${labelId}"`);
     }
 }
 
@@ -104,7 +97,7 @@ export async function deleteLabel(gmail: any, labelId: string) {
         });
         
         if (label.data.type === 'system') {
-            throw new Error(`Cannot delete system label with ID "${labelId}".`);
+            throw new ToolFailure('not_allowed', `Could not delete the label "${labelId}": it is a system label`);
         }
         
         await gmail.users.labels.delete({
@@ -114,11 +107,7 @@ export async function deleteLabel(gmail: any, labelId: string) {
 
         return { success: true, message: `Label "${label.data.name}" deleted successfully.` };
     } catch (error: any) {
-        if (error.code === 404) {
-            throw new Error(`Label with ID "${labelId}" not found.`);
-        }
-        
-        throw new Error(`Failed to delete label: ${error.message}`);
+        throw toolFailure(error, `Could not delete the label "${labelId}"`);
     }
 }
 
@@ -150,7 +139,7 @@ export async function listLabels(gmail: any) {
             }
         };
     } catch (error: any) {
-        throw new Error(`Failed to list labels: ${error.message}`);
+        throw toolFailure(error, 'Could not list the labels');
     }
 }
 
@@ -172,7 +161,7 @@ export async function findLabelByName(gmail: any, labelName: string) {
         
         return foundLabel || null;
     } catch (error: any) {
-        throw new Error(`Failed to find label: ${error.message}`);
+        throw toolFailure(error, `Could not look up the label "${labelName}"`);
     }
 }
 
@@ -198,6 +187,6 @@ export async function getOrCreateLabel(gmail: any, labelName: string, options: {
         // If not found, create a new one
         return await createLabel(gmail, labelName, options);
     } catch (error: any) {
-        throw new Error(`Failed to get or create label: ${error.message}`);
+        throw toolFailure(error, `Could not get or create the label "${labelName}"`);
     }
 }

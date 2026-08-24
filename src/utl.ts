@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { lookup as mimeLookup } from 'mime-types';
 import nodemailer from 'nodemailer';
+import { ToolFailure, toolFailure } from './failureEnvelope.js';
 
 /**
  * Helper function to encode email headers containing non-ASCII characters
@@ -38,7 +39,7 @@ export function createEmailMessage(validatedArgs: any): string {
     // Validate email addresses
     (validatedArgs.to as string[]).forEach(email => {
         if (!validateEmail(email)) {
-            throw new Error(`Recipient email address is invalid: ${email}`);
+            throw new ToolFailure('bad_request', `Could not build the email: "${email}" is not a valid email address`);
         }
     });
 
@@ -101,7 +102,7 @@ export async function createEmailWithNodemailer(validatedArgs: any): Promise<str
     // Validate email addresses
     (validatedArgs.to as string[]).forEach(email => {
         if (!validateEmail(email)) {
-            throw new Error(`Recipient email address is invalid: ${email}`);
+            throw new ToolFailure('bad_request', `Could not build the email: "${email}" is not a valid email address`);
         }
     });
 
@@ -116,7 +117,7 @@ export async function createEmailWithNodemailer(validatedArgs: any): Promise<str
     const attachments = [];
     for (const filePath of validatedArgs.attachments) {
         if (!fs.existsSync(filePath)) {
-            throw new Error(`File does not exist: ${filePath}`);
+            throw new ToolFailure('not_found', `Could not attach "${filePath}": there is no file at that path`);
         }
         
         const fileName = path.basename(filePath);
@@ -141,7 +142,12 @@ export async function createEmailWithNodemailer(validatedArgs: any): Promise<str
     };
 
     // Generate the raw message
-    const info = await transporter.sendMail(mailOptions);
+    let info;
+    try {
+        info = await transporter.sendMail(mailOptions);
+    } catch (error) {
+        throw toolFailure(error, 'Could not build the email message with its attachments');
+    }
     const rawMessage = info.message.toString();
     
     return rawMessage;
