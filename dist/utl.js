@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import nodemailer from 'nodemailer';
+import { ToolFailure, toolFailure } from './failureEnvelope.js';
 /**
  * Helper function to encode email headers containing non-ASCII characters
  * according to RFC 2047 MIME specification
@@ -31,7 +32,7 @@ export function createEmailMessage(validatedArgs) {
     // Validate email addresses
     validatedArgs.to.forEach(email => {
         if (!validateEmail(email)) {
-            throw new Error(`Recipient email address is invalid: ${email}`);
+            throw new ToolFailure('bad_request', `Could not build the email: "${email}" is not a valid email address`);
         }
     });
     // Common email headers
@@ -88,7 +89,7 @@ export async function createEmailWithNodemailer(validatedArgs) {
     // Validate email addresses
     validatedArgs.to.forEach(email => {
         if (!validateEmail(email)) {
-            throw new Error(`Recipient email address is invalid: ${email}`);
+            throw new ToolFailure('bad_request', `Could not build the email: "${email}" is not a valid email address`);
         }
     });
     // Create a nodemailer transporter (we won't actually send, just generate the message)
@@ -101,7 +102,7 @@ export async function createEmailWithNodemailer(validatedArgs) {
     const attachments = [];
     for (const filePath of validatedArgs.attachments) {
         if (!fs.existsSync(filePath)) {
-            throw new Error(`File does not exist: ${filePath}`);
+            throw new ToolFailure('not_found', `Could not attach "${filePath}": there is no file at that path`);
         }
         const fileName = path.basename(filePath);
         attachments.push({
@@ -122,7 +123,13 @@ export async function createEmailWithNodemailer(validatedArgs) {
         references: validatedArgs.inReplyTo
     };
     // Generate the raw message
-    const info = await transporter.sendMail(mailOptions);
+    let info;
+    try {
+        info = await transporter.sendMail(mailOptions);
+    }
+    catch (error) {
+        throw toolFailure(error, 'Could not build the email message with its attachments');
+    }
     const rawMessage = info.message.toString();
     return rawMessage;
 }
