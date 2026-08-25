@@ -19,6 +19,7 @@ import os from 'os';
 import {createEmailMessage, createEmailWithNodemailer} from "./utl.js";
 import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, getOrCreateLabel, GmailLabel } from "./label-manager.js";
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
+import { searchHeader } from "./searchsummary.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -208,9 +209,18 @@ const ReadEmailSchema = z.object({
     messageId: z.string().describe("ID of the email message to retrieve"),
 });
 
+// How many a search returns when nobody says. Ten was the old default and it is too few to answer
+// "what did they say about X" without a second call, while being small enough that the shortfall was
+// invisible. Twenty five is still one screenful of headers (about 4KB) and covers the ordinary ask;
+// anything larger is a deliberate request via `maxResults`, and the count in the header says when one
+// is worth making.
+const DEFAULT_SEARCH_RESULTS = 25;
+
 const SearchEmailsSchema = z.object({
     query: z.string().describe("Gmail search query (e.g., 'from:example@gmail.com')"),
-    maxResults: z.number().optional().describe("Maximum number of results to return"),
+    maxResults: z.number().optional()
+        .describe(`How many to return (default ${DEFAULT_SEARCH_RESULTS}). The result says how many `
+                  + `matched in total, so ask again with a bigger number if it was cut short.`),
 });
 
 // Updated schema to include removeLabelIds
@@ -672,10 +682,21 @@ async function main() {
 
                 case "search_emails": {
                     const validatedArgs = SearchEmailsSchema.parse(args);
+                    // A SEARCH SAYS HOW MANY IT FOUND, NOT JUST WHAT IT IS SHOWING.
+                    //
+                    // This used to answer with ten messages and nothing else, whatever the mailbox held,
+                    // and a caller had no way to tell ten-because-that-is-all from ten-because-we-stopped.
+                    // Watched live: "Search my email for anything about invoices and tell me how many you
+                    // found" came back with "I found 10 emails matching invoices", which is a false
+                    // statement about somebody's mailbox that the agent had no way to avoid making.
+                    //
+                    // Gmail already returns `resultSizeEstimate` on this call and it was being thrown
+                    // away, so the honest answer costs nothing.
+                    const wanted = validatedArgs.maxResults ?? DEFAULT_SEARCH_RESULTS;
                     const response = await gmail.users.messages.list({
                         userId: 'me',
                         q: validatedArgs.query,
-                        maxResults: validatedArgs.maxResults || 10,
+                        maxResults: wanted,
                     });
 
                     const messages = response.data.messages || [];
@@ -697,11 +718,17 @@ async function main() {
                         })
                     );
 
+                    // Gmail's own estimate, which is what its web interface shows you and is approximate
+                    // for large mailboxes. Never reported as smaller than what we are actually holding.
+                    const header = searchHeader(results.length,
+                                                response.data.resultSizeEstimate ?? results.length,
+                                                validatedArgs.query);
+
                     return {
                         content: [
                             {
                                 type: "text",
-                                text: results.map(r =>
+                                text: results.length === 0 ? header : `${header}\n\n` + results.map(r =>
                                     `ID: ${r.id}\nSubject: ${r.subject}\nFrom: ${r.from}\nDate: ${r.date}\n`
                                 ).join('\n'),
                             },
