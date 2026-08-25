@@ -1,6 +1,6 @@
 {
   "name": "@gongrzhe/server-gmail-autoauth-mcp",
-  "version": "1.1.11",
+  "version": "1.1.11-faces.3",
   "description": "Gmail MCP server with auto authentication support",
   "type": "module",
   "main": "dist/index.js",
@@ -12,7 +12,8 @@
     "start": "node dist/index.js",
     "auth": "node dist/index.js auth",
     "prepare": "npm run build",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "test": "npm run build && node --test dist/*.test.js"
   },
   "files": [
     "dist",
